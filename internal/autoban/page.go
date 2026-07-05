@@ -4,8 +4,19 @@ import "html"
 
 // statusPage renders the browser-navigable resource page. It is unauthenticated
 // itself; the API calls it makes require the CPA management key entered by the user.
-func statusPage() string {
+// currentMode is the plugin's active mode, used to preselect the mode switch.
+func statusPage(currentMode string) string {
 	version := html.EscapeString(PluginVersion)
+	mode := currentMode
+	if mode != ModeDelete {
+		mode = ModeDisable
+	}
+	disableSel, deleteSel := "", ""
+	if mode == ModeDelete {
+		deleteSel = " selected"
+	} else {
+		disableSel = " selected"
+	}
 	return `<!doctype html>
 <html lang="en">
 <head>
@@ -19,7 +30,7 @@ func statusPage() string {
     .muted { color: #667085; }
     .card { border: 1px solid #d0d7de; border-radius: 12px; padding: 16px; margin: 16px 0; }
     label { display: block; font-weight: 600; margin-bottom: 6px; }
-    input { width: min(640px, 100%); padding: 8px 10px; border: 1px solid #d0d7de; border-radius: 8px; }
+    input, select { width: min(640px, 100%); padding: 8px 10px; border: 1px solid #d0d7de; border-radius: 8px; }
     button { cursor: pointer; padding: 8px 12px; border: 1px solid #d0d7de; border-radius: 8px; margin: 4px 4px 4px 0; }
     button.primary { background: #0969da; border-color: #0969da; color: white; }
     button.danger { background: #cf222e; border-color: #cf222e; color: white; }
@@ -48,6 +59,18 @@ func statusPage() string {
   </div>
 
   <div class="card">
+    <h2>Action mode / 动作模式</h2>
+    <p class="muted">What to do to an account whose auth token is invalidated. Saving requires the management key above and applies live (no restart). 保存需填入上方管理密钥，即时生效。</p>
+    <label for="mode">Mode / 模式</label>
+    <select id="mode">
+      <option value="disable"` + disableSel + `>disable — write disabled:true, keep the file / 禁用（保留文件）</option>
+      <option value="delete"` + deleteSel + `>delete — remove the credential file / 删除凭证文件</option>
+    </select>
+    <div><button class="primary" onclick="saveMode()">Save mode / 保存模式</button></div>
+    <p class="muted">Current: <code id="currentMode">` + mode + `</code></p>
+  </div>
+
+  <div class="card">
     <h2>Handled accounts / 已处理账号</h2>
     <p class="muted">"Forget" only clears this plugin's in-memory ban so a re-authenticated account can be scheduled again. It does not restore a deleted file. 「清除」仅解除插件内存中的封禁，不会恢复已删除的凭证文件。</p>
     <div id="list">Not loaded yet.</div>
@@ -55,9 +78,10 @@ func statusPage() string {
 
   <div class="card">
     <h2>API</h2>
-    <pre>GET  /v0/management/plugins/codex-fail-autoban/accounts
-POST /v0/management/plugins/codex-fail-autoban/forget   {"auth_id":"..."}
-POST /v0/management/plugins/codex-fail-autoban/forget   {"all":true}</pre>
+    <pre>GET   /v0/management/plugins/codex-fail-autoban/accounts
+POST  /v0/management/plugins/codex-fail-autoban/forget   {"auth_id":"..."}
+POST  /v0/management/plugins/codex-fail-autoban/forget   {"all":true}
+PATCH /v0/management/plugins/codex-fail-autoban/config    {"mode":"delete"}   (CPA core)</pre>
   </div>
 
   <script>
@@ -119,12 +143,30 @@ POST /v0/management/plugins/codex-fail-autoban/forget   {"all":true}</pre>
         + "<table><thead><tr><th>Auth ID</th><th>Provider</th><th>File</th><th>State</th><th>Reason</th><th>In ban list</th><th></th></tr></thead><tbody>"
         + rows + "</tbody></table>";
     }
+    function syncMode(mode) {
+      if (!mode) return;
+      const sel = document.getElementById("mode");
+      if (sel) sel.value = mode;
+      const cur = document.getElementById("currentMode");
+      if (cur) cur.textContent = mode;
+    }
     async function refresh() {
       try {
         setMessage("Loading...");
         const data = await call("/accounts");
+        syncMode(data && data.mode);
         render(data);
         setMessage("Loaded " + data.count + " account(s).");
+      } catch (err) { setMessage(err.message, true); }
+    }
+    async function saveMode() {
+      const mode = document.getElementById("mode").value;
+      if (!confirm("Set mode to \"" + mode + "\"?" + (mode === "delete" ? " Delete permanently removes credential files." : ""))) return;
+      try {
+        // /config is CPA's core plugin-config endpoint (shallow-merge), not a plugin route.
+        await call("/config", {method: "PATCH", body: JSON.stringify({mode: mode})});
+        syncMode(mode);
+        setMessage("Mode saved: " + mode + " (applies live).");
       } catch (err) { setMessage(err.message, true); }
     }
     // Delegated handler: the Forget button carries the auth id in a data- attribute

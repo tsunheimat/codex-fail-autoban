@@ -55,7 +55,10 @@ func (h *Handler) dispatchManagement(req pluginapi.ManagementRequest) pluginapi.
 	// Resource (browser HTML) route is matched first: it is served WITHOUT
 	// management auth, so it must never fall through into a management-API handler.
 	case method == http.MethodGet && matchesResourcePath(req.Path, "/status"):
-		return htmlResponse(http.StatusOK, statusPage())
+		h.mu.Lock()
+		mode := h.cfg.Mode
+		h.mu.Unlock()
+		return htmlResponse(http.StatusOK, statusPage(mode))
 	case method == http.MethodGet && matchesManagementPath(req.Path, "/accounts"):
 		return jsonResponse(http.StatusOK, h.statusSnapshot())
 	case method == http.MethodPost && matchesManagementPath(req.Path, "/forget"):

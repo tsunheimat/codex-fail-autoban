@@ -634,6 +634,22 @@ func TestManagementResourcePageServesHTML(t *testing.T) {
 	if ct := resp.Headers.Get("Content-Type"); !strings.Contains(ct, "text/html") {
 		t.Fatalf("resource content-type = %q, want text/html", ct)
 	}
+	if !strings.Contains(body, `<select id="mode">`) || !strings.Contains(body, "saveMode()") {
+		t.Fatal("resource page should include the mode switch")
+	}
+}
+
+func TestResourcePagePreselectsActiveMode(t *testing.T) {
+	host := newHostWith("idx1", "/auth/codex-a.json", codexCredential(t))
+	h := registerHandler(t, host, newFakeFiles(), "enabled: true\nmode: delete\n")
+	resp := h.dispatchManagement(pluginapi.ManagementRequest{Method: "GET", Path: "/v0/resource/plugins/" + PluginName + "/status"})
+	body := string(resp.Body)
+	if !strings.Contains(body, `value="delete" selected`) {
+		t.Fatalf("delete mode should be preselected in the switch")
+	}
+	if strings.Contains(body, `value="disable" selected`) {
+		t.Fatal("disable should not be selected when mode is delete")
+	}
 }
 
 func TestManagementAccountsRouteServesJSON(t *testing.T) {

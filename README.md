@@ -148,6 +148,8 @@ A resource page (also shown in the CPA management UI plugin menu):
 /v0/resource/plugins/codex-fail-autoban/status
 ```
 
+The page shows the active **mode** and includes a **disable / delete switch** — enter your CPA management key, pick the mode, and **Save** (it applies live via `PATCH /v0/management/plugins/codex-fail-autoban/config`, no restart). It also lists handled accounts with a per-account **Forget**.
+
 API (requires the CPA management key; supports `Authorization: Bearer <key>`):
 
 ```bash

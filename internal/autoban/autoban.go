@@ -36,7 +36,7 @@ func mustEmptyResultEnvelope() []byte {
 // agree on the id used in route prefixes.
 const (
 	PluginName    = "codex-fail-autoban"
-	PluginVersion = "0.1.1"
+	PluginVersion = "0.1.2"
 
 	managementRoutePrefix = "/plugins/" + PluginName
 )
