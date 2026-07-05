@@ -1,0 +1,11 @@
+# Local build artifacts
+*.dll
+*.so
+*.dylib
+*.h
+
+# OS clutter
+.DS_Store
+Thumbs.db
+
+# Note: go.sum and vendor/ ARE committed so the CGO build is reproducible/offline.
