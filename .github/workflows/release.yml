@@ -27,11 +27,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Each target is built natively (CGO cross-compilation is avoided) so the
+        # C toolchain always matches the target arch. The plugin store selects the
+        # asset matching each user's GOOS/GOARCH, so broad coverage matters.
         include:
           - goos: linux
             goarch: amd64
             runner: ubuntu-latest
             ext: so
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-24.04-arm
+            ext: so
+          - goos: darwin
+            goarch: amd64
+            runner: macos-13
+            ext: dylib
           - goos: darwin
             goarch: arm64
             runner: macos-latest
