@@ -36,7 +36,7 @@ func mustEmptyResultEnvelope() []byte {
 // agree on the id used in route prefixes.
 const (
 	PluginName    = "codex-fail-autoban"
-	PluginVersion = "0.1.0"
+	PluginVersion = "0.1.1"
 
 	managementRoutePrefix = "/plugins/" + PluginName
 )
@@ -196,6 +196,11 @@ func configFields() []pluginapi.ConfigField {
 			Type:        pluginapi.ConfigFieldTypeBoolean,
 			Description: "When true, log the decision but do not modify or delete any credential file.",
 		},
+		{
+			Name:        "debug",
+			Type:        pluginapi.ConfigFieldTypeBoolean,
+			Description: "When true, log every failed request the plugin sees (provider, auth id, status, body, decision) to help diagnose accounts that were not processed.",
+		},
 	}
 }
 
@@ -216,6 +221,18 @@ func (h *Handler) handleUsage(raw []byte) {
 	h.mu.Unlock()
 
 	reason, ok := detect(cfg, record)
+	if cfg.Debug && record.Failed {
+		// Show exactly what the plugin received, so a missed account can be
+		// diagnosed (wrong provider value, empty auth_id, no matching needle, …).
+		h.log.Info(PluginName+": [debug] observed failed request",
+			"provider", record.Provider,
+			"auth_id", record.AuthID,
+			"auth_index", record.AuthIndex,
+			"status_code", record.Failure.StatusCode,
+			"body", truncateForLog(record.Failure.Body, 400),
+			"would_act", ok,
+			"reason", reason)
+	}
 	if !ok {
 		return
 	}
@@ -409,22 +426,23 @@ func (h *Handler) handleSchedulerPick(raw []byte) ([]byte, error) {
 	return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: chosen.ID, Handled: true})
 }
 
-// detect returns the ban reason and whether the record is a terminal per-account
-// auth failure that the plugin should act on.
+// detect reports whether the record is a terminal per-account auth failure the
+// plugin should act on. The returned reason explains the decision either way (it
+// is the ban reason when ok, or the skip reason when not) — used for debug logs.
 func detect(cfg Config, record pluginapi.UsageRecord) (reason string, ok bool) {
 	if !cfg.Enabled {
-		return "", false
+		return "plugin disabled", false
 	}
 	if !record.Failed {
-		return "", false
+		return "request did not fail", false
 	}
 	if !providerAllowed(cfg, record.Provider) {
-		return "", false
+		return fmt.Sprintf("provider %q not in configured providers", record.Provider), false
 	}
 	// A specific account must have been selected. The empty-pool "no auth
 	// available" error (which reuses the auth_unavailable code) carries no AuthID.
 	if strings.TrimSpace(record.AuthID) == "" {
-		return "", false
+		return "no auth_id (e.g. empty-pool error)", false
 	}
 
 	// Lowercase the body once, only when there is one (a pure status failure has
@@ -434,7 +452,7 @@ func detect(cfg Config, record pluginapi.UsageRecord) (reason string, ok bool) {
 		body = strings.ToLower(record.Failure.Body)
 		for _, ignore := range cfg.IgnoreBodySubstrings {
 			if ignore != "" && strings.Contains(body, ignore) {
-				return "", false
+				return fmt.Sprintf("vetoed by ignore substring %q", ignore), false
 			}
 		}
 	}
@@ -447,11 +465,11 @@ func detect(cfg Config, record pluginapi.UsageRecord) (reason string, ok bool) {
 	if body != "" {
 		for _, needle := range cfg.MatchBodySubstrings {
 			if needle != "" && strings.Contains(body, needle) {
-				return "body contains " + needle, true
+				return fmt.Sprintf("body contains %q", needle), true
 			}
 		}
 	}
-	return "", false
+	return fmt.Sprintf("no status/body match (status=%d)", record.Failure.StatusCode), false
 }
 
 func providerAllowed(cfg Config, provider string) bool {
@@ -460,6 +478,15 @@ func providerAllowed(cfg Config, provider string) bool {
 		return false
 	}
 	return slices.Contains(cfg.Providers, provider)
+}
+
+// truncateForLog trims a body to a bounded, single-line form for debug logging.
+func truncateForLog(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if len(s) > max {
+		s = s[:max] + "…(truncated)"
+	}
+	return s
 }
 
 // providerFromCredential extracts the "type" field CPA stores in every auth file.

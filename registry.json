@@ -6,7 +6,7 @@
       "name": "Codex Fail Autoban",
       "description": "Auto-disable or delete a Codex credential when its auth token is invalidated (authentication_error / auth_unavailable, HTTP 401).",
       "author": "tsunheimat",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "repository": "https://github.com/tsunheimat/codex-fail-autoban",
       "homepage": "https://github.com/tsunheimat/codex-fail-autoban",
       "license": "MIT",

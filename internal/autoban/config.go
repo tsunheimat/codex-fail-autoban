@@ -39,14 +39,29 @@ type Config struct {
 	IgnoreBodySubstrings []string
 	// DryRun logs the decision but performs no filesystem change.
 	DryRun bool
+	// Debug logs, for every failed request the plugin observes, the provider,
+	// auth id, status code, body, and the ban decision (with the reason it did or
+	// did not act). Use it to see exactly what the plugin receives.
+	Debug bool
 }
 
-// Default configuration values. These are chosen to catch exactly the Codex
-// token-invalidation error while never firing on the unrelated empty-pool error.
+// Default configuration values. They are meant to catch any per-account auth
+// failure (invalidated/expired token, unauthorized, revoked oauth grant, …)
+// while never firing on the unrelated empty-pool "no auth available" error.
 var (
-	defaultProviders            = []string{"codex"}
-	defaultMatchStatusCodes     = []int{401}
-	defaultMatchBodySubstrings  = []string{"authentication_error", "auth_unavailable", "invalid_api_key", "invalid or expired token", "refresh_token_reused", "has been invalidated"}
+	defaultProviders        = []string{"codex"}
+	defaultMatchStatusCodes = []int{401}
+	// Lower-cased, auth-specific needles. CPA reclassifies Codex auth failures so
+	// the body usually carries "authentication_error"/"auth_unavailable", but the
+	// upstream wording varies ("invalidated oauth token", "expired", …), so match
+	// broadly on auth-only phrases to avoid missing a variant.
+	defaultMatchBodySubstrings = []string{
+		"authentication_error", "auth_unavailable",
+		"invalid_api_key", "invalid_grant", "invalid_client", "invalid_token",
+		"invalidated", "oauth token", "expired token", "token expired", "token has expired",
+		"invalid or expired token", "refresh_token_reused", "unauthorized",
+		"sign in again", "log in again", "re-authenticate", "reauthenticate", "please sign in",
+	}
 	defaultIgnoreBodySubstrings = []string{"no auth available"}
 )
 
@@ -61,6 +76,7 @@ func DefaultConfig() Config {
 		MatchBodySubstrings:  append([]string(nil), defaultMatchBodySubstrings...),
 		IgnoreBodySubstrings: append([]string(nil), defaultIgnoreBodySubstrings...),
 		DryRun:               false,
+		Debug:                false,
 	}
 }
 
@@ -74,6 +90,7 @@ type rawConfig struct {
 	MatchBodySubstrings  flexStrings `yaml:"match-body-substrings"`
 	IgnoreBodySubstrings flexStrings `yaml:"ignore-body-substrings"`
 	DryRun               *bool       `yaml:"dry-run"`
+	Debug                *bool       `yaml:"debug"`
 }
 
 // ParseConfig builds an effective Config from a plugin config YAML subtree.
@@ -112,6 +129,9 @@ func ParseConfig(configYAML []byte) Config {
 	}
 	if raw.DryRun != nil {
 		cfg.DryRun = *raw.DryRun
+	}
+	if raw.Debug != nil {
+		cfg.Debug = *raw.Debug
 	}
 	return cfg
 }

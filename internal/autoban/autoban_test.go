@@ -2,6 +2,7 @@ package autoban
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -10,6 +11,31 @@ import (
 	"codex-fail-autoban/cpasdk/pluginabi"
 	"codex-fail-autoban/cpasdk/pluginapi"
 )
+
+// captureLogger records log lines so tests can assert on debug output.
+type captureLogger struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (c *captureLogger) record(msg string, args ...any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lines = append(c.lines, msg+" "+fmt.Sprint(args...))
+}
+func (c *captureLogger) Info(m string, a ...any)  { c.record(m, a...) }
+func (c *captureLogger) Warn(m string, a ...any)  { c.record(m, a...) }
+func (c *captureLogger) Error(m string, a ...any) { c.record(m, a...) }
+func (c *captureLogger) contains(s string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, l := range c.lines {
+		if strings.Contains(l, s) {
+			return true
+		}
+	}
+	return false
+}
 
 // ---- fakes -------------------------------------------------------------------
 
@@ -228,6 +254,53 @@ func TestDetectExactUserError(t *testing.T) {
 		Failure: pluginapi.UsageFailure{StatusCode: 401, Body: body}}
 	if _, ok := detect(enabledCfg(), rec); !ok {
 		t.Fatal("the exact reported error must be detected")
+	}
+}
+
+func TestDetectInvalidatedOauthToken(t *testing.T) {
+	// The newer upstream wording the user hit — different from the original.
+	body := `{"error":{"message":"Encountered invalidated oauth token for user, failing request","type":"authentication_error","code":"auth_unavailable"}}`
+	rec := pluginapi.UsageRecord{Provider: "codex", AuthID: "acc-1", Failed: true,
+		Failure: pluginapi.UsageFailure{StatusCode: 401, Body: body}}
+	if _, ok := detect(enabledCfg(), rec); !ok {
+		t.Fatal("invalidated-oauth-token error must be detected")
+	}
+}
+
+func TestDetectInvalidatedOauthTokenBodyOnlyNon401(t *testing.T) {
+	// Even with a non-401 status and only the raw message (no classified JSON),
+	// the broadened "invalidated"/"oauth token" needles must still catch it.
+	rec := pluginapi.UsageRecord{Provider: "codex", AuthID: "acc-1", Failed: true,
+		Failure: pluginapi.UsageFailure{StatusCode: 500, Body: "Encountered invalidated oauth token for user, failing request"}}
+	if _, ok := detect(enabledCfg(), rec); !ok {
+		t.Fatal("raw invalidated-oauth-token message must be detected via body needle")
+	}
+}
+
+func TestDetectSkipReasonIsExplanatory(t *testing.T) {
+	// The skip path returns a human-readable reason (surfaced by debug logging).
+	rec := pluginapi.UsageRecord{Provider: "gemini", AuthID: "acc-1", Failed: true,
+		Failure: pluginapi.UsageFailure{StatusCode: 401, Body: "authentication_error"}}
+	reason, ok := detect(enabledCfg(), rec)
+	if ok || !strings.Contains(reason, "provider") {
+		t.Fatalf("expected a provider skip reason, got ok=%v reason=%q", ok, reason)
+	}
+}
+
+func TestDebugLogsEveryFailedRecord(t *testing.T) {
+	// With debug on, even a skipped (non-codex) failure is logged, so a user can
+	// see whether the failing account reached the plugin at all.
+	cl := &captureLogger{}
+	h := NewHandler(newHostWith("idx1", "/auth/codex-a.json", codexCredential(t)), newFakeFiles(), cl)
+	req, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("enabled: true\nmode: disable\ndebug: true\n")})
+	if _, err := h.Handle(pluginabi.MethodPluginRegister, req); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := json.Marshal(pluginapi.UsageRecord{Provider: "gemini", AuthID: "x", Failed: true,
+		Failure: pluginapi.UsageFailure{StatusCode: 500, Body: "boom"}})
+	h.handleUsage(rec)
+	if !cl.contains("[debug] observed failed request") || !cl.contains("provider") {
+		t.Fatalf("expected a debug line with provider, got %v", cl.lines)
 	}
 }
 

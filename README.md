@@ -52,11 +52,12 @@ plugins:
       priority: 100          # higher runs earlier; keep it high so the ban is applied before other schedulers
       mode: disable          # "disable" (default) or "delete"
       # dry-run: true        # log the decision but change nothing (great for a first run)
+      # debug: true          # log every failed request the plugin sees (see Troubleshooting)
 
       # Advanced (all optional — sensible defaults shown):
       # providers: [codex]
       # match-status-codes: [401]
-      # match-body-substrings: ["authentication_error", "auth_unavailable", "invalid_api_key", "invalid or expired token", "refresh_token_reused", "has been invalidated"]
+      # match-body-substrings: ["authentication_error", "auth_unavailable", "invalidated", "oauth token", "unauthorized", "expired token", "invalid_grant", ...]
       # ignore-body-substrings: ["no auth available"]
 ```
 
@@ -65,11 +66,21 @@ plugins:
 | `mode` | `disable` | `disable` = write `disabled:true` into the credential file (kept, survives restart). `delete` = remove the credential file. |
 | `providers` | `[codex]` | Provider keys the plugin acts on. |
 | `match-status-codes` | `[401]` | HTTP failure status codes that trigger a ban. |
-| `match-body-substrings` | auth signatures | Case-insensitive needles in the failure body that trigger a ban. |
+| `match-body-substrings` | auth signatures | Case-insensitive needles in the failure body that trigger a ban. Defaults cover the common auth wordings (`authentication_error`, `auth_unavailable`, `invalidated`, `oauth token`, `unauthorized`, `expired token`, `invalid_grant`, …). |
 | `ignore-body-substrings` | `["no auth available"]` | Case-insensitive needles that veto a ban (empty-pool guard). |
 | `dry-run` | `false` | When true, log the decision but never modify or delete a file. The account is still dropped from *this run's* scheduling. |
+| `debug` | `false` | When true, log every failed request the plugin observes (provider, auth id, status, body, decision + reason). |
 
-List keys accept either a YAML sequence (`[a, b]`) or a single comma-separated string (`"a,b"`). Config changes are picked up on `plugin.reconfigure` without a full restart.
+List keys accept either a YAML sequence (`[a, b]`) or a single comma-separated string (`"a,b"`). A list key **replaces** the default (it is not merged), so include every value you want. Config changes are picked up on `plugin.reconfigure` without a full restart.
+
+### Troubleshooting — an account wasn't disabled/deleted
+
+Set `debug: true` and reproduce. For every failed request the plugin logs a line tagged `codex-fail-autoban: [debug] observed failed request` with `provider`, `auth_id`, `status_code`, `body`, `would_act`, and `reason`. That tells you exactly why:
+
+- **No debug line at all when the error happens** → the failing account's request never reached the plugin as a failed usage record (CPA may have retried/failed-over). 
+- **`provider="…"` that isn't in your `providers`** → add that provider key to `providers`.
+- **`would_act=false` with a `reason`** (e.g. `no status/body match (status=…)`) → add that status to `match-status-codes` or a needle from the body to `match-body-substrings`.
+- **`auth_id` empty** → it was the pool-empty error, correctly ignored.
 
 ## Install
 
