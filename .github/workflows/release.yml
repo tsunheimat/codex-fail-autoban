@@ -39,9 +39,12 @@ jobs:
             goarch: arm64
             runner: ubuntu-24.04-arm
             ext: so
+          # darwin/amd64 is cross-compiled on the Apple-Silicon runner: Go's cgo
+          # targets x86_64 via clang -arch, and the macOS SDK is universal. This
+          # avoids the scarce/queued Intel (macos-13) hosted runners.
           - goos: darwin
             goarch: amd64
-            runner: macos-13
+            runner: macos-latest
             ext: dylib
           - goos: darwin
             goarch: arm64
