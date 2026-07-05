@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"codex-fail-autoban/cpasdk/pluginabi"
@@ -39,8 +40,39 @@ type osFileOps struct{}
 
 func (osFileOps) Remove(path string) error { return os.Remove(path) }
 
+// WriteFile replaces a credential file atomically: it writes to a temp file in
+// the same directory and renames it over the target. This guarantees the only
+// copy of the credential is never left truncated/partial if the process dies or
+// the disk fills mid-write (disable mode is meant to be recoverable).
 func (osFileOps) WriteFile(path string, data []byte, perm os.FileMode) error {
-	return os.WriteFile(path, data, perm)
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".codex-fail-autoban-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err = tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err = tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 // OSFileOps returns the production filesystem implementation.

@@ -47,16 +47,15 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"unsafe"
 )
 
 // savedHost is the host API captured in cliproxy_plugin_init (main.go). The host
 // owns and keeps the struct alive for the plugin's lifetime, so the pointer stays
-// valid. It is written once before any plugin method runs and read-only after.
-var (
-	savedHost *C.cliproxy_host_api
-	hostReady bool
-)
+// valid. It is published atomically so a plugin-call goroutine reading it has a
+// proper happens-before edge with the init-thread write.
+var savedHost atomic.Pointer[C.cliproxy_host_api]
 
 // rememberHost stores the host API pointer. main.go passes it as an unsafe.Pointer
 // so the cgo struct type never has to be shared across files.
@@ -64,15 +63,15 @@ func rememberHost(p unsafe.Pointer) {
 	if p == nil {
 		return
 	}
-	savedHost = (*C.cliproxy_host_api)(p)
-	hostReady = savedHost.call != nil
+	savedHost.Store((*C.cliproxy_host_api)(p))
 }
 
 // cHostAPI implements autoban.HostAPI over the native reverse-call pointers.
 type cHostAPI struct{}
 
 func (cHostAPI) Call(method string, request []byte) ([]byte, error) {
-	if !hostReady || savedHost == nil {
+	host := savedHost.Load()
+	if host == nil {
 		return nil, errors.New("host reverse-call is unavailable")
 	}
 	cMethod := C.CString(method)
@@ -85,14 +84,14 @@ func (cHostAPI) Call(method string, request []byte) ([]byte, error) {
 	}
 
 	var resp C.cliproxy_buffer
-	rc := C.invoke_host_call(savedHost, cMethod, cReq, C.size_t(len(request)), &resp)
+	rc := C.invoke_host_call(host, cMethod, cReq, C.size_t(len(request)), &resp)
 
 	var out []byte
 	if resp.ptr != nil && resp.len > 0 {
 		out = C.GoBytes(resp.ptr, C.int(resp.len))
 	}
 	if resp.ptr != nil {
-		C.invoke_host_free(savedHost, resp.ptr, resp.len)
+		C.invoke_host_free(host, resp.ptr, resp.len)
 	}
 
 	// The host reports call failures by returning an {ok:false,error} envelope in

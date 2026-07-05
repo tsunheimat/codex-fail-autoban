@@ -181,6 +181,21 @@ func TestParseConfigMalformedKeepsDefaults(t *testing.T) {
 	}
 }
 
+func TestParseConfigTolerantOfBadListElement(t *testing.T) {
+	// A single unparseable list element must NOT discard the whole config (which
+	// would drop the host-injected enabled:true and silently disable the plugin).
+	cfg := ParseConfig([]byte("enabled: true\nmode: delete\nmatch-status-codes: [401, \"5xx\", 403]\n"))
+	if !cfg.Enabled {
+		t.Fatal("a bad list element must not disable the plugin")
+	}
+	if cfg.Mode != ModeDelete {
+		t.Fatalf("mode lost, got %q", cfg.Mode)
+	}
+	if len(cfg.MatchStatusCodes) != 2 || cfg.MatchStatusCodes[0] != 401 || cfg.MatchStatusCodes[1] != 403 {
+		t.Fatalf("bad element should be skipped, kept %v", cfg.MatchStatusCodes)
+	}
+}
+
 // ---- detection ---------------------------------------------------------------
 
 func enabledCfg() Config {
@@ -341,9 +356,13 @@ func TestUsageDryRunTouchesNothing(t *testing.T) {
 	if len(files.removed) != 0 || len(files.written) != 0 {
 		t.Fatalf("dry-run must not touch fs: removes=%v writes=%v", files.removed, files.written)
 	}
-	// But the account should still be excluded from scheduling immediately.
-	if !h.excluded["acc-1"] {
-		t.Fatal("dry-run should still exclude the account from scheduling")
+	// dry-run is pure observation: it must NOT mutate scheduling state either.
+	if h.excluded["acc-1"] {
+		t.Fatal("dry-run must not exclude the account from scheduling")
+	}
+	// It is still recorded (for /status visibility) and idempotent.
+	if st := h.statusSnapshot(); len(st.Accounts) != 1 || !st.Accounts[0].DryRun {
+		t.Fatalf("dry-run should record a dry_run account, got %+v", st.Accounts)
 	}
 }
 
@@ -391,6 +410,28 @@ func TestActionProviderSafetyNet(t *testing.T) {
 	if len(st.Accounts) != 1 || st.Accounts[0].Error == "" {
 		t.Fatalf("expected an error record, got %+v", st.Accounts)
 	}
+	// A refused account must NOT be held out of scheduling.
+	if h.excluded["acc-1"] {
+		t.Fatal("a refused account must not be excluded from scheduling")
+	}
+}
+
+func TestUsageResolveErrorDoesNotExclude(t *testing.T) {
+	// host.auth.get fails -> the account is not resolvable, so we must not disable
+	// it, must not exclude it, and must allow a later retry.
+	host := &fakeHost{failGet: true}
+	files := newFakeFiles()
+	h := registerHandler(t, host, files, "enabled: true\nmode: delete\n")
+
+	h.handleUsage(failedCodex("acc-1", "idx1", 401, "authentication_error"))
+
+	if len(files.removed) != 0 || h.excluded["acc-1"] {
+		t.Fatalf("resolve failure must not act or exclude: removed=%v excluded=%v", files.removed, h.excluded["acc-1"])
+	}
+	st := h.statusSnapshot()
+	if len(st.Accounts) != 1 || st.Accounts[0].Error == "" {
+		t.Fatalf("expected an errored record for retry, got %+v", st.Accounts)
+	}
 }
 
 // ---- scheduler ---------------------------------------------------------------
@@ -415,26 +456,54 @@ func decodePick(t *testing.T, raw []byte) pluginapi.SchedulerPickResponse {
 	return resp
 }
 
-func TestSchedulerDelegatesWhenNothingBanned(t *testing.T) {
+func TestSchedulerDeclinesWhenNothingBanned(t *testing.T) {
+	// With no bans, the plugin must decline (Handled=false) so the host keeps its
+	// own configured scheduling strategy instead of being forced onto round-robin.
 	h := NewHandler(nil, newFakeFiles(), nopLogger{})
 	raw, err := h.handleSchedulerPick(schedulerReq("a", "b", "c"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp := decodePick(t, raw)
-	if resp.DelegateBuiltin != pluginapi.SchedulerBuiltinRoundRobin || !resp.Handled {
-		t.Fatalf("expected round-robin delegation, got %+v", resp)
+	if resp.Handled || resp.AuthID != "" || resp.DelegateBuiltin != "" {
+		t.Fatalf("expected decline, got %+v", resp)
 	}
 }
 
-func TestSchedulerDropsBanned(t *testing.T) {
+func TestSchedulerDeclinesWhenNoneOfTheseCandidatesBanned(t *testing.T) {
+	// A ban exists, but for an auth not among these candidates: still decline.
 	h := NewHandler(nil, newFakeFiles(), nopLogger{})
-	h.excluded["b"] = true
-	raw, _ := h.handleSchedulerPick(schedulerReq("a", "b", "c")) // priorities a=0,b=1,c=2
-	resp := decodePick(t, raw)
-	if resp.AuthID != "c" { // highest priority survivor
-		t.Fatalf("expected highest-priority survivor c, got %+v", resp)
+	h.excluded["someone-else"] = true
+	raw, _ := h.handleSchedulerPick(schedulerReq("a", "b", "c"))
+	if decodePick(t, raw).Handled {
+		t.Fatal("expected decline when no candidate is banned")
 	}
+}
+
+func TestSchedulerDropsBannedAndRotates(t *testing.T) {
+	h := NewHandler(nil, newFakeFiles(), nopLogger{})
+	h.excluded["b"] = true // survivors: a, c
+	// Two consecutive picks must rotate across the survivors, never returning b.
+	var picks []string
+	for i := 0; i < 4; i++ {
+		resp := decodePick(t, mustPick(t, h, schedulerReq("a", "b", "c")))
+		if !resp.Handled || resp.AuthID == "b" {
+			t.Fatalf("pick %d returned banned/unhandled: %+v", i, resp)
+		}
+		picks = append(picks, resp.AuthID)
+	}
+	if picks[0] == picks[1] {
+		t.Fatalf("expected rotation across survivors, got %v", picks)
+	}
+}
+
+func mustPick(t *testing.T, h *Handler, req []byte) []byte {
+	t.Helper()
+	raw, err := h.handleSchedulerPick(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
 
 func TestSchedulerAllBannedDeclines(t *testing.T) {
@@ -474,11 +543,40 @@ func TestManagementStatusAndForget(t *testing.T) {
 	}
 }
 
-func TestManagementResourcePageServed(t *testing.T) {
+func TestManagementResourcePageServesHTML(t *testing.T) {
+	// The unauthenticated resource route must serve the HTML page, NOT be shadowed
+	// by the management JSON handler (which would leak the account list).
 	h := NewHandler(nil, newFakeFiles(), nopLogger{})
 	resp := h.dispatchManagement(pluginapi.ManagementRequest{Method: "GET", Path: "/v0/resource/plugins/" + PluginName + "/status"})
-	if resp.StatusCode != 200 || !strings.Contains(string(resp.Body), "codex-fail-autoban") {
-		t.Fatalf("resource page not served: %d", resp.StatusCode)
+	if resp.StatusCode != 200 {
+		t.Fatalf("resource page status = %d", resp.StatusCode)
+	}
+	body := string(resp.Body)
+	if !strings.Contains(body, "<!doctype html>") {
+		t.Fatalf("resource route must serve HTML, got: %.60q", body)
+	}
+	if strings.Contains(body, "\"accounts\"") {
+		t.Fatal("resource route leaked the JSON account snapshot instead of HTML")
+	}
+	if ct := resp.Headers.Get("Content-Type"); !strings.Contains(ct, "text/html") {
+		t.Fatalf("resource content-type = %q, want text/html", ct)
+	}
+}
+
+func TestManagementAccountsRouteServesJSON(t *testing.T) {
+	host := newHostWith("idx1", "/auth/codex-a.json", codexCredential(t))
+	h := registerHandler(t, host, newFakeFiles(), "enabled: true\nmode: disable\n")
+	h.handleUsage(failedCodex("acc-1", "idx1", 401, "authentication_error"))
+
+	resp := h.dispatchManagement(pluginapi.ManagementRequest{Method: "GET", Path: "/v0/management/plugins/" + PluginName + "/accounts"})
+	if resp.StatusCode != 200 {
+		t.Fatalf("accounts status = %d", resp.StatusCode)
+	}
+	if ct := resp.Headers.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("accounts content-type = %q, want json", ct)
+	}
+	if !strings.Contains(string(resp.Body), "acc-1") {
+		t.Fatalf("accounts JSON missing handled account: %s", resp.Body)
 	}
 }
 

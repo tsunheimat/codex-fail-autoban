@@ -10,6 +10,7 @@ package autoban
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,19 @@ import (
 	"codex-fail-autoban/cpasdk/pluginabi"
 	"codex-fail-autoban/cpasdk/pluginapi"
 )
+
+// emptyResultEnvelope is the constant {"ok":true,"result":{}} reply returned on
+// the hot paths (usage.handle, plugin.shutdown), precomputed to avoid re-marshaling
+// it per request. The bytes are treated as read-only by callers.
+var emptyResultEnvelope = mustEmptyResultEnvelope()
+
+func mustEmptyResultEnvelope() []byte {
+	raw, err := okEnvelope(map[string]any{})
+	if err != nil {
+		return []byte(`{"ok":true,"result":{}}`)
+	}
+	return raw
+}
 
 // Plugin identity. Kept here so both the registration and the management surface
 // agree on the id used in route prefixes.
@@ -42,20 +56,17 @@ type actionRecord struct {
 	At        time.Time `json:"at"`
 }
 
-// done reports whether the account has been acted on successfully (so a
-// concurrent or repeated failure does not repeat the filesystem mutation).
-func (a actionRecord) done() bool { return a.Error == "" && !a.Pending }
-
 // Handler holds plugin state across the long-lived plugin process.
 type Handler struct {
 	host  HostAPI
 	files FileOps
 	log   Logger
 
-	mu       sync.Mutex
-	cfg      Config
-	excluded map[string]bool         // auth IDs to drop from scheduler.pick this process
-	acted    map[string]actionRecord // auth IDs already handled (idempotency + status)
+	mu          sync.Mutex
+	cfg         Config
+	excluded    map[string]bool         // auth IDs to drop from scheduler.pick this process
+	acted       map[string]actionRecord // auth IDs already handled (idempotency + status)
+	pickCounter uint64                  // rotates the scheduler pick across surviving candidates
 }
 
 // NewHandler builds a handler. A nil files or log is replaced with a safe default.
@@ -92,7 +103,7 @@ func (h *Handler) Handle(method string, request []byte) ([]byte, error) {
 		return okEnvelope(h.registration())
 	case pluginabi.MethodUsageHandle:
 		h.handleUsage(request)
-		return okEnvelope(map[string]any{})
+		return emptyResultEnvelope, nil
 	case pluginabi.MethodSchedulerPick:
 		return h.handleSchedulerPick(request)
 	case pluginabi.MethodManagementRegister:
@@ -100,7 +111,7 @@ func (h *Handler) Handle(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodManagementHandle:
 		return h.handleManagement(request)
 	case pluginabi.MethodPluginShutdown:
-		return okEnvelope(map[string]any{})
+		return emptyResultEnvelope, nil
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -210,11 +221,12 @@ func (h *Handler) handleUsage(raw []byte) {
 	}
 
 	authID := strings.TrimSpace(record.AuthID)
-	// Reserve the account: exclude it immediately and claim the action so
-	// concurrent failures for the same account do not double-act.
+	// Claim the account so concurrent duplicate failures do not double-act. We do
+	// NOT add it to the scheduler ban here: exclusion happens only once we have
+	// actually acted, so an account we cannot resolve or deliberately refuse to
+	// touch is never silently held out of rotation. Retry a prior errored attempt.
 	h.mu.Lock()
-	h.excluded[authID] = true
-	if prev, seen := h.acted[authID]; seen && (prev.done() || prev.Pending) {
+	if prev, seen := h.acted[authID]; seen && (prev.Error == "" || prev.Pending) {
 		h.mu.Unlock()
 		return
 	}
@@ -233,7 +245,15 @@ func (h *Handler) handleUsage(raw []byte) {
 	result := h.performAction(cfg, record, reason)
 
 	h.mu.Lock()
-	h.acted[authID] = result
+	// Respect a concurrent /forget: only record the result (and apply the ban) if
+	// the account is still tracked, so a forget that landed while we acted is not
+	// resurrected. Exclude from scheduling only on a real, non-dry-run success.
+	if _, stillTracked := h.acted[authID]; stillTracked {
+		h.acted[authID] = result
+		if result.Error == "" && !cfg.DryRun {
+			h.excluded[authID] = true
+		}
+	}
 	h.mu.Unlock()
 
 	if result.Error != "" {
@@ -275,10 +295,11 @@ func (h *Handler) performAction(cfg Config, record pluginapi.UsageRecord, reason
 		result.Provider = fileProvider
 	}
 
-	// Safety net: never touch a file whose provider is outside the configured
-	// set, even if the host mapped the auth index to an unexpected credential.
-	if fileProvider != "" && !providerAllowed(cfg, fileProvider) {
-		result.Error = "resolved credential provider " + fileProvider + " is not in the configured providers; refusing to act"
+	// Safety net (fail closed): only act on a file whose provider is confirmed to
+	// be in the configured set. If the credential type cannot be read (empty or
+	// typeless JSON), refuse — never delete/disable an unverifiable file.
+	if !providerAllowed(cfg, fileProvider) {
+		result.Error = fmt.Sprintf("resolved credential provider %q is not confirmed in the configured providers; refusing to act", fileProvider)
 		return result
 	}
 
@@ -345,14 +366,26 @@ func (h *Handler) lookupAuthIndexByID(authID string) (string, error) {
 	return "", fmt.Errorf("no auth_index found for auth id %s", authID)
 }
 
-// handleSchedulerPick drops banned candidates, mirroring codex-429-autoban.
+// handleSchedulerPick drops banned candidates from selection. It intervenes ONLY
+// when it actually has a banned candidate to remove; otherwise it declines so the
+// host applies its own configured scheduling strategy (this plugin must not impose
+// a strategy on providers or requests it is not filtering).
 func (h *Handler) handleSchedulerPick(raw []byte) ([]byte, error) {
 	var req pluginapi.SchedulerPickRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
 
+	decline := func() ([]byte, error) {
+		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
+	}
+
 	h.mu.Lock()
+	// Fast path: nothing is banned, so there is nothing to filter.
+	if len(h.excluded) == 0 {
+		h.mu.Unlock()
+		return decline()
+	}
 	available := make([]pluginapi.SchedulerAuthCandidate, 0, len(req.Candidates))
 	for _, candidate := range req.Candidates {
 		if h.excluded[candidate.ID] {
@@ -360,27 +393,19 @@ func (h *Handler) handleSchedulerPick(raw []byte) ([]byte, error) {
 		}
 		available = append(available, candidate)
 	}
+	// If we dropped nothing (none of these candidates are banned) or everything
+	// (all banned — let the host error/cooldown), decline and let the host choose.
+	if len(available) == len(req.Candidates) || len(available) == 0 {
+		h.mu.Unlock()
+		return decline()
+	}
+	// Some candidates were banned. The ABI only lets us name a single auth or
+	// delegate over the FULL (unfilterable) set, so we must pick a survivor here.
+	// Rotate across survivors to preserve load-balancing instead of pinning one.
+	chosen := available[int(h.pickCounter%uint64(len(available)))]
+	h.pickCounter++
 	h.mu.Unlock()
 
-	// Nothing banned: let CPA's own round-robin run over the full set.
-	if len(available) == len(req.Candidates) {
-		return okEnvelope(pluginapi.SchedulerPickResponse{
-			DelegateBuiltin: pluginapi.SchedulerBuiltinRoundRobin,
-			Handled:         true,
-		})
-	}
-	// Everything banned: decline so the host decides (error / cooldown).
-	if len(available) == 0 {
-		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
-	}
-	// Some banned: pick the highest-priority survivor ourselves, since delegating
-	// would let round-robin re-select a banned candidate from the full set.
-	chosen := available[0]
-	for _, c := range available[1:] {
-		if c.Priority > chosen.Priority {
-			chosen = c
-		}
-	}
 	return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: chosen.ID, Handled: true})
 }
 
@@ -402,10 +427,15 @@ func detect(cfg Config, record pluginapi.UsageRecord) (reason string, ok bool) {
 		return "", false
 	}
 
-	body := strings.ToLower(record.Failure.Body)
-	for _, ignore := range cfg.IgnoreBodySubstrings {
-		if ignore != "" && strings.Contains(body, ignore) {
-			return "", false
+	// Lowercase the body once, only when there is one (a pure status failure has
+	// none). The ignore veto must run before a status match can succeed.
+	var body string
+	if record.Failure.Body != "" {
+		body = strings.ToLower(record.Failure.Body)
+		for _, ignore := range cfg.IgnoreBodySubstrings {
+			if ignore != "" && strings.Contains(body, ignore) {
+				return "", false
+			}
 		}
 	}
 
@@ -414,9 +444,11 @@ func detect(cfg Config, record pluginapi.UsageRecord) (reason string, ok bool) {
 			return fmt.Sprintf("status %d", code), true
 		}
 	}
-	for _, needle := range cfg.MatchBodySubstrings {
-		if needle != "" && strings.Contains(body, needle) {
-			return "body contains " + needle, true
+	if body != "" {
+		for _, needle := range cfg.MatchBodySubstrings {
+			if needle != "" && strings.Contains(body, needle) {
+				return "body contains " + needle, true
+			}
 		}
 	}
 	return "", false
@@ -427,12 +459,7 @@ func providerAllowed(cfg Config, provider string) bool {
 	if provider == "" {
 		return false
 	}
-	for _, p := range cfg.Providers {
-		if p == provider {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(cfg.Providers, provider)
 }
 
 // providerFromCredential extracts the "type" field CPA stores in every auth file.

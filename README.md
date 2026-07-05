@@ -142,7 +142,7 @@ API (requires the CPA management key; supports `Authorization: Bearer <key>`):
 ```bash
 # List accounts the plugin has disabled/deleted
 curl -H "Authorization: Bearer $CPA_MANAGEMENT_KEY" \
-  http://localhost:8317/v0/management/plugins/codex-fail-autoban/status
+  http://localhost:8317/v0/management/plugins/codex-fail-autoban/accounts
 
 # Forget one account's in-memory ban (after you re-authenticate it)
 curl -X POST -H "Authorization: Bearer $CPA_MANAGEMENT_KEY" \

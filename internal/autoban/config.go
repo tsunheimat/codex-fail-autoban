@@ -155,61 +155,64 @@ func dedupeInts(in []int) []int {
 }
 
 // flexStrings accepts a YAML scalar (optionally comma-separated) or a sequence.
+// Parsing is lenient and never errors: an unusable element is skipped rather than
+// failing the whole config (a single bad element must not silently disable the
+// plugin by discarding the host-injected enabled:true).
 type flexStrings []string
 
 func (f *flexStrings) UnmarshalYAML(value *yaml.Node) error {
+	*f = scalarTokens(value)
+	return nil
+}
+
+// flexInts accepts a YAML scalar (optionally comma-separated) or a sequence.
+// Non-integer elements are skipped rather than failing the parse (see flexStrings).
+type flexInts []int
+
+func (f *flexInts) UnmarshalYAML(value *yaml.Node) error {
+	tokens := scalarTokens(value)
+	out := make([]int, 0, len(tokens))
+	for _, t := range tokens {
+		if n, err := strconv.Atoi(t); err == nil {
+			out = append(out, n)
+		}
+	}
+	*f = out
+	return nil
+}
+
+// scalarTokens flattens a YAML node into trimmed, non-empty scalar tokens. A
+// scalar is comma-split; a sequence yields each scalar element; anything else
+// (mappings, nested sequences) is ignored.
+func scalarTokens(value *yaml.Node) []string {
+	if value == nil {
+		return nil
+	}
 	switch value.Kind {
 	case yaml.ScalarNode:
-		parts := strings.Split(value.Value, ",")
-		out := make([]string, 0, len(parts))
-		for _, p := range parts {
-			if p = strings.TrimSpace(p); p != "" {
-				out = append(out, p)
+		return splitCSV(value.Value)
+	case yaml.SequenceNode:
+		out := make([]string, 0, len(value.Content))
+		for _, n := range value.Content {
+			if n != nil && n.Kind == yaml.ScalarNode {
+				if v := strings.TrimSpace(n.Value); v != "" {
+					out = append(out, v)
+				}
 			}
 		}
-		*f = out
-		return nil
-	case yaml.SequenceNode:
-		var out []string
-		if err := value.Decode(&out); err != nil {
-			return err
-		}
-		*f = out
-		return nil
+		return out
 	default:
 		return nil
 	}
 }
 
-// flexInts accepts a YAML scalar (optionally comma-separated) or a sequence.
-type flexInts []int
-
-func (f *flexInts) UnmarshalYAML(value *yaml.Node) error {
-	switch value.Kind {
-	case yaml.ScalarNode:
-		parts := strings.Split(value.Value, ",")
-		out := make([]int, 0, len(parts))
-		for _, p := range parts {
-			p = strings.TrimSpace(p)
-			if p == "" {
-				continue
-			}
-			n, err := strconv.Atoi(p)
-			if err != nil {
-				return err
-			}
-			out = append(out, n)
+func splitCSV(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
 		}
-		*f = out
-		return nil
-	case yaml.SequenceNode:
-		var out []int
-		if err := value.Decode(&out); err != nil {
-			return err
-		}
-		*f = out
-		return nil
-	default:
-		return nil
 	}
+	return out
 }

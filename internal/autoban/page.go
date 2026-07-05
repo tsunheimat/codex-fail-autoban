@@ -55,7 +55,7 @@ func statusPage() string {
 
   <div class="card">
     <h2>API</h2>
-    <pre>GET  /v0/management/plugins/codex-fail-autoban/status
+    <pre>GET  /v0/management/plugins/codex-fail-autoban/accounts
 POST /v0/management/plugins/codex-fail-autoban/forget   {"auth_id":"..."}
 POST /v0/management/plugins/codex-fail-autoban/forget   {"all":true}</pre>
   </div>
@@ -93,9 +93,6 @@ POST /v0/management/plugins/codex-fail-autoban/forget   {"all":true}</pre>
         return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c];
       });
     }
-    function escapeJs(value) {
-      return String(value == null ? "" : value).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-    }
     function render(data) {
       const list = document.getElementById("list");
       if (!data || !data.accounts || data.accounts.length === 0) {
@@ -114,7 +111,7 @@ POST /v0/management/plugins/codex-fail-autoban/forget   {"all":true}</pre>
           + "<td>" + state + (a.error ? "<br><span class=\"muted\">" + escapeHtml(a.error) + "</span>" : "") + "</td>"
           + "<td>" + escapeHtml(a.reason) + "</td>"
           + "<td>" + (a.excluded ? "yes" : "no") + "</td>"
-          + "<td><button onclick=\"forget('" + escapeJs(a.auth_id) + "')\">Forget</button></td>"
+          + "<td><button class=\"forget-btn\" data-auth=\"" + escapeHtml(a.auth_id) + "\">Forget</button></td>"
           + "</tr>";
       }
       list.innerHTML = "<p class=\"muted\">Mode: <code>" + escapeHtml(data.mode) + "</code>"
@@ -125,11 +122,17 @@ POST /v0/management/plugins/codex-fail-autoban/forget   {"all":true}</pre>
     async function refresh() {
       try {
         setMessage("Loading...");
-        const data = await call("/status");
+        const data = await call("/accounts");
         render(data);
         setMessage("Loaded " + data.count + " account(s).");
       } catch (err) { setMessage(err.message, true); }
     }
+    // Delegated handler: the Forget button carries the auth id in a data- attribute
+    // (HTML-escaped), avoiding any inline-JS string interpolation / attribute escape.
+    document.getElementById("list").addEventListener("click", function (e) {
+      const btn = e.target.closest("button.forget-btn");
+      if (btn) forget(btn.getAttribute("data-auth"));
+    });
     async function forget(authID) {
       if (!confirm("Forget ban state for " + authID + "?")) return;
       try {

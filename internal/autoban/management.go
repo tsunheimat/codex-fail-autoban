@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"codex-fail-autoban/cpasdk/pluginapi"
 )
@@ -14,8 +15,11 @@ func managementRegistration() pluginapi.ManagementRegistrationResponse {
 	return pluginapi.ManagementRegistrationResponse{
 		Routes: []pluginapi.ManagementRoute{
 			{
+				// Distinct suffix from the "/status" resource page below: sharing
+				// "/status" makes the loose path matcher route the unauthenticated
+				// resource GET into this (data-leaking) JSON handler.
 				Method:      http.MethodGet,
-				Path:        managementRoutePrefix + "/status",
+				Path:        managementRoutePrefix + "/accounts",
 				Description: "List accounts codex-fail-autoban has disabled or deleted after an auth failure.",
 			},
 			{
@@ -48,12 +52,14 @@ func (h *Handler) dispatchManagement(req pluginapi.ManagementRequest) pluginapi.
 		method = http.MethodGet
 	}
 	switch {
-	case method == http.MethodGet && matchesManagementPath(req.Path, "/status"):
+	// Resource (browser HTML) route is matched first: it is served WITHOUT
+	// management auth, so it must never fall through into a management-API handler.
+	case method == http.MethodGet && matchesResourcePath(req.Path, "/status"):
+		return htmlResponse(http.StatusOK, statusPage())
+	case method == http.MethodGet && matchesManagementPath(req.Path, "/accounts"):
 		return jsonResponse(http.StatusOK, h.statusSnapshot())
 	case method == http.MethodPost && matchesManagementPath(req.Path, "/forget"):
 		return h.handleForget(req)
-	case method == http.MethodGet && matchesResourcePath(req.Path, "/status"):
-		return htmlResponse(http.StatusOK, statusPage())
 	default:
 		return jsonResponse(http.StatusNotFound, map[string]any{
 			"error":  "not_found",
@@ -105,7 +111,7 @@ func (h *Handler) statusSnapshot() statusResponse {
 			Pending:   rec.Pending,
 			Error:     rec.Error,
 			Excluded:  h.excluded[authID],
-			At:        rec.At.UTC().Format("2006-01-02T15:04:05Z07:00"),
+			At:        rec.At.UTC().Format(time.RFC3339),
 		})
 	}
 	sort.Slice(accounts, func(i, j int) bool {
